@@ -1,6 +1,6 @@
 # Approval Ratio Analysis dashboard
 
-This Streamlit dashboard calculates approval performance from a transaction-report CSV. It supports date and timezone controls, multi-select filters for PSP, country, and MID, two approval-ratio definitions, PSP decline reasons, country-level PSP comparisons, and hard/soft decline lists.
+This Streamlit dashboard calculates cascaded approval performance from a transaction-report CSV. It supports date and timezone controls, multi-select filters for PSP, country, and MID, two approval-ratio definitions, PSP decline reasons, country-level PSP comparisons, and hard/soft decline lists.
 
 ## Data protection
 
@@ -13,6 +13,7 @@ The dashboard accepts a CSV at runtime. Use a private GitHub repository and a pr
 The dashboard needs:
 
 - `status`, with `approved` and `declined` values
+- `merchantOrderId`, used to identify one checkout session across PSP retries
 - One processing-time field: `processing_date` (UTC timestamp) or `processingDate` (Unix seconds)
 
 It uses these fields when available:
@@ -22,20 +23,29 @@ It uses these fields when available:
 - `midAlias` for MID analysis
 - `declineReason`, `statusReason`, and `declineCode` for decline lists and classification
 
-Each usable source row is treated as one payment attempt.
+## Cascaded checkout-session logic
+
+The dashboard does not use the raw transaction-row count as the approval-ratio denominator.
+
+1. It groups attempts by `merchantOrderId`.
+2. A checkout session is **approved** if any attempt in that group is approved.
+3. A checkout session is **declined** only when no attempt in the group is approved. Its latest decline supplies the PSP, country, MID, decline reason, and hard/soft classification.
+4. The result is one outcome per checkout session, so a failed PSP attempt followed by a successful retry does not double-count the same customer checkout.
+
+The August 20–31 source report therefore contains 69,707 raw attempts but 51,409 checkout sessions: 38,843 approved and 12,566 declined. The combined approval ratio with hard declines is 38,843 ÷ 51,409 = **75.56%**.
 
 ## Approval-ratio definitions
 
 | Measure | Formula |
 | --- | --- |
-| Approval ratio (with hard) | Approved ÷ all attempts |
-| Approval ratio (without hard) | Approved ÷ (Approved + soft declines) |
+| Approval ratio (with hard) | Approved checkout sessions ÷ all checkout sessions |
+| Approval ratio (without hard) | Approved checkout sessions ÷ (Approved checkout sessions + soft-declined checkout sessions) |
 
-The second measure removes hard declines from the denominator only. This is shown on the overview and every PSP, country, and MID table.
+The second measure removes terminal hard-declined checkout sessions from the denominator only. This is shown on the overview and every PSP, country, and MID table.
 
 ## Hard/soft decline classification
 
-The dashboard includes conservative default hard-decline codes and reason patterns. Every declined transaction not matching a hard rule is treated as soft so both ratios remain available. This is a starting point, not a substitute for each PSP's approved retry policy.
+The dashboard includes conservative default hard-decline codes and reason patterns. Every terminal declined checkout session not matching a hard rule is treated as soft so both ratios remain available. This is a starting point, not a substitute for each PSP's approved retry policy.
 
 To change the classification for an analysis session, upload an override CSV using the same columns as [config/decline_overrides.example.csv](config/decline_overrides.example.csv):
 

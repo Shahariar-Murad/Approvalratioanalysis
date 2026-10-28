@@ -17,6 +17,7 @@ from analytics import (
     DEFAULT_HARD_RULES,
     DataValidationError,
     apply_filters,
+    collapse_checkout_sessions,
     daily_performance,
     decline_catalog,
     performance_by_country,
@@ -44,11 +45,12 @@ def prepare_uploaded_report(
 ) -> tuple[pd.DataFrame, object]:
     raw = read_transaction_csv(transaction_bytes)
     overrides = read_override_csv(override_bytes) if override_bytes else None
-    return prepare_transactions(raw, overrides)
+    attempts, diagnostics = prepare_transactions(raw, overrides)
+    return collapse_checkout_sessions(attempts), diagnostics
 
 
 def format_ratio(value: object) -> str:
-    return "—" if pd.isna(value) else f"{float(value):.1%}"
+    return "—" if pd.isna(value) else f"{float(value):.2%}"
 
 
 def ratio_styler(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
@@ -66,12 +68,12 @@ def ratio_styler(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
     count_columns = [
         column
         for column in (
-            "Attempts",
+            "Checkout sessions",
             "Approved",
             "Declined",
             "Hard declines",
             "Soft declines",
-            "Eligible attempts",
+            "Eligible checkout sessions",
             "Top reason count",
             "PSPs compared",
             "Declines",
@@ -80,7 +82,7 @@ def ratio_styler(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
         )
         if column in frame.columns
     ]
-    formats = {column: "{:.1%}" for column in percentage_columns}
+    formats = {column: "{:.2%}" for column in percentage_columns}
     formats.update({column: "{:,.0f}" for column in count_columns})
     return frame.style.format(formats, na_rep="—")
 
@@ -91,7 +93,7 @@ def show_metric_cards(summary: pd.DataFrame) -> None:
         return
     metrics = summary.iloc[0]
     cards = st.columns(6)
-    cards[0].metric("Attempts", f"{metrics['Attempts']:,.0f}")
+    cards[0].metric("Checkout sessions", f"{metrics['Checkout sessions']:,.0f}")
     cards[1].metric("Approved", f"{metrics['Approved']:,.0f}")
     cards[2].metric("Approval ratio (with hard)", format_ratio(metrics["Approval ratio (with hard)"]))
     cards[3].metric(
@@ -133,15 +135,16 @@ def download_button(frame: pd.DataFrame, filename: str, label: str) -> None:
 def main() -> None:
     st.title("Approval Ratio Analysis dashboard")
     st.caption(
-        "Approval ratio (with hard) = approved ÷ all attempts. Approval ratio (without hard) = "
-        "approved ÷ (approved + soft declines)."
+        "Approval ratio (with hard) = approved checkout sessions ÷ all checkout sessions. "
+        "Approval ratio (without hard) = approved checkout sessions ÷ "
+        "(approved checkout sessions + soft-declined checkout sessions)."
     )
 
     st.sidebar.header("Data source")
     transaction_upload = st.sidebar.file_uploader(
         "Transaction report CSV",
         type=["csv"],
-        help="Upload a report with processing date, status, PSP, country, MID, and decline fields.",
+        help="Upload a report with processing date, merchant order ID, status, PSP, country, MID, and decline fields.",
     )
     override_upload = st.sidebar.file_uploader(
         "Optional hard/soft override CSV",
@@ -153,8 +156,8 @@ def main() -> None:
         st.info("Upload a transaction report CSV to begin the analysis.")
         with st.expander("Expected source fields"):
             st.markdown(
-                "Required: `status` and either `processing_date` (UTC timestamp) or `processingDate` "
-                "(Unix seconds). The dashboard also uses `pspName`, `country`, `midAlias`, "
+                "Required: `status`, `merchantOrderId`, and either `processing_date` (UTC timestamp) or "
+                "`processingDate` (Unix seconds). The dashboard also uses `pspName`, `country`, `midAlias`, "
                 "`declineReason`, `statusReason`, and `declineCode` when available."
             )
         st.stop()
@@ -230,17 +233,17 @@ def main() -> None:
         index=0,
     )
     minimum_attempts = st.sidebar.number_input(
-        "Minimum PSP attempts per country",
+        "Minimum PSP checkout sessions per country",
         min_value=1,
         max_value=100_000,
         value=20,
         step=1,
-        help="PSPs below this volume are excluded from the country best/worst comparison.",
+        help="PSPs below this session volume are excluded from the country best/worst comparison.",
     )
 
     show_metric_cards(summarize_metrics(filtered))
     st.caption(
-        f"{len(filtered):,} usable attempts after filters. Date boundaries use {timezone_name}; "
+        f"{len(filtered):,} checkout sessions after filters. Date boundaries use {timezone_name}; "
         "empty PSP, country, and MID selectors mean all values."
     )
 
@@ -269,7 +272,8 @@ def main() -> None:
             detail = pd.DataFrame(
                 [
                     ("Source rows", diagnostics.source_rows),
-                    ("Usable approved/declined rows", diagnostics.usable_rows),
+                    ("Usable approved/declined source attempts", diagnostics.usable_rows),
+                    ("Checkout sessions after PSP-retry cascade", len(data)),
                     ("Excluded unknown statuses", diagnostics.excluded_unknown_status),
                     ("Excluded missing timestamps", diagnostics.excluded_missing_timestamp),
                     ("Timestamp column(s) used", diagnostics.timestamp_source),
@@ -282,9 +286,10 @@ def main() -> None:
             for warning in diagnostics.override_warnings:
                 st.warning(warning)
             st.markdown(
-                "Each usable source row is treated as one payment attempt. The app applies the timezone "
-                "conversion before filtering on the local processing date. Hard/soft classification is "
-                "rule-based and can be overridden with the optional mapping upload."
+                "Each `merchantOrderId` is counted once. A checkout session becomes approved if any "
+                "attempt succeeds; otherwise its latest declined attempt is the terminal outcome. The app "
+                "applies the timezone conversion before filtering on the terminal outcome date. Hard/soft "
+                "classification is rule-based and can be overridden with the optional mapping upload."
             )
 
     with psp_tab:
@@ -298,13 +303,13 @@ def main() -> None:
     with country_tab:
         st.subheader("Country-wise approval ratio")
         country = performance_by_country(filtered, int(minimum_attempts), ranking_choice)
-        chart_data = country.head(20).sort_values("Attempts", ascending=True)
-        approval_ratio_chart(chart_data, "country_label", "Approval ratio by country (top 20 by attempts)")
+        chart_data = country.head(20).sort_values("Checkout sessions", ascending=True)
+        approval_ratio_chart(chart_data, "country_label", "Approval ratio by country (top 20 by checkout sessions)")
         country_display = country.rename(
             columns={"country_label": "Country", "country_name": "Country name", "country_code": "Country code"}
         ).drop(columns=["Country name", "Country code"], errors="ignore")
         st.caption(
-            f"Best and worst PSPs use {ranking_choice.lower()} and require at least {int(minimum_attempts):,} attempts."
+            f"Best and worst PSPs use {ranking_choice.lower()} and require at least {int(minimum_attempts):,} checkout sessions."
         )
         st.dataframe(ratio_styler(country_display), hide_index=True, use_container_width=True, height=520)
         download_button(country_display, "country_approval_ratio.csv", "Download country analysis")

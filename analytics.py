@@ -291,6 +291,18 @@ def prepare_transactions(
     epoch_timestamp_column = _find_column(raw, ["processingDate", "processing_date_epoch"])
     if iso_timestamp_column is None and epoch_timestamp_column is None:
         raise DataValidationError("Missing required processing timestamp column.")
+    merchant_order_column = _find_column(raw, ["merchantOrderId", "merchant_order_id"])
+    if merchant_order_column is None:
+        raise DataValidationError(
+            "Missing required column: merchantOrderId. It is required to collapse PSP retries into checkout sessions."
+        )
+    merchant_order_id = _clean_text(raw[merchant_order_column])
+    missing_merchant_orders = merchant_order_id.eq("")
+    if missing_merchant_orders.any():
+        raise DataValidationError(
+            f"{int(missing_merchant_orders.sum()):,} row(s) have no merchantOrderId. "
+            "A cascaded approval ratio cannot be calculated safely."
+        )
 
     status = _clean_text(raw[status_column]).str.casefold()
     is_approved = status.eq("approved")
@@ -325,6 +337,11 @@ def prepare_transactions(
     data["psp_name"] = _first_nonempty(raw, ["pspName", "psp", "provider"]).replace("", "PSP not provided")
     data["mid_alias"] = _first_nonempty(raw, ["midAlias", "mid", "merchant_id"]).replace("", "MID not provided")
     data["country_code"] = _first_nonempty(raw, ["country", "countryCode"]).str.upper().replace("", "Country not provided")
+    generated_row_id = pd.Series(
+        [f"source-row-{position}" for position in range(len(raw))], index=raw.index, dtype="string"
+    )
+    data["checkout_session_id"] = merchant_order_id
+    data["source_row_id"] = generated_row_id
     data["decline_code"] = _first_nonempty(raw, ["declineCode", "decline_code"]).replace("", "Code not provided")
     data["decline_reason"] = _first_nonempty(
         raw, ["declineReason", "statusReason", "decline_reason", "status_reason"]
@@ -344,6 +361,61 @@ def prepare_transactions(
         override_warnings=tuple(override_warnings),
     )
     return data, diagnostics
+
+
+def collapse_checkout_sessions(data: pd.DataFrame) -> pd.DataFrame:
+    """Collapse PSP retries into one checkout outcome per merchant order.
+
+    A checkout session is approved if any attempt sharing ``merchantOrderId`` is
+    approved. Otherwise, the latest declined attempt is its terminal outcome.
+    This implements the cascaded approval-ratio definition:
+
+    approved checkout sessions / (approved checkout sessions + unique failed
+    checkout sessions).
+    """
+
+    if data.empty:
+        result = data.copy()
+        result["Attempts in session"] = pd.Series(dtype="int")
+        result["PSPs tried"] = pd.Series(dtype="int")
+        return result
+
+    ordered = data.sort_values(
+        ["checkout_session_id", "processing_time_utc", "source_row_id"], kind="stable"
+    ).copy()
+    any_success = ordered.groupby("checkout_session_id", dropna=False, observed=True)[
+        "is_approved"
+    ].transform("any")
+    # For a successful session, report the latest successful attempt. For a
+    # session with no approval, report the terminal decline.
+    outcome_candidates = ordered.loc[(any_success & ordered["is_approved"]) | ~any_success].copy()
+    outcomes = (
+        outcome_candidates.groupby("checkout_session_id", dropna=False, observed=True, sort=False)
+        .tail(1)
+        .copy()
+    )
+    session_details = (
+        ordered.groupby("checkout_session_id", dropna=False, observed=True)
+        .agg(
+            **{
+                "Attempts in session": ("status", "size"),
+                "PSPs tried": ("psp_name", "nunique"),
+            }
+        )
+        .reset_index()
+    )
+    outcomes = outcomes.merge(session_details, on="checkout_session_id", how="left")
+    outcomes["is_approved"] = outcomes["is_approved"].astype(bool)
+    outcomes["is_declined"] = ~outcomes["is_approved"]
+    outcomes["status"] = outcomes["is_approved"].map({True: "approved", False: "declined"})
+    successful = outcomes["is_approved"]
+    outcomes.loc[successful, "decline_class"] = "Not declined"
+    outcomes.loc[successful, "decline_rule"] = "Cascade outcome: approved"
+    outcomes["is_hard_decline"] = outcomes["is_declined"] & outcomes["decline_class"].eq("Hard")
+    outcomes["is_soft_decline"] = outcomes["is_declined"] & outcomes["decline_class"].eq("Soft")
+    outcomes["Attempts in session"] = outcomes["Attempts in session"].astype(int)
+    outcomes["PSPs tried"] = outcomes["PSPs tried"].astype(int)
+    return outcomes.reset_index(drop=True)
 
 
 def with_local_time(data: pd.DataFrame, timezone_name: str) -> pd.DataFrame:
@@ -380,12 +452,12 @@ def apply_filters(
 
 
 METRIC_COLUMNS = [
-    "Attempts",
+    "Checkout sessions",
     "Approved",
     "Declined",
     "Hard declines",
     "Soft declines",
-    "Eligible attempts",
+    "Eligible checkout sessions",
     "Approval ratio (with hard)",
     "Approval ratio (without hard)",
 ]
@@ -403,7 +475,7 @@ def summarize_metrics(data: pd.DataFrame, group_columns: Sequence[str] = ()) -> 
             data.groupby(groups, dropna=False, observed=True)
             .agg(
                 **{
-                    "Attempts": ("status", "size"),
+                    "Checkout sessions": ("status", "size"),
                     "Approved": ("is_approved", "sum"),
                     "Declined": ("is_declined", "sum"),
                     "Hard declines": ("is_hard_decline", "sum"),
@@ -416,7 +488,7 @@ def summarize_metrics(data: pd.DataFrame, group_columns: Sequence[str] = ()) -> 
         summary = pd.DataFrame(
             [
                 {
-                    "Attempts": len(data),
+                    "Checkout sessions": len(data),
                     "Approved": int(data["is_approved"].sum()),
                     "Declined": int(data["is_declined"].sum()),
                     "Hard declines": int(data["is_hard_decline"].sum()),
@@ -425,12 +497,12 @@ def summarize_metrics(data: pd.DataFrame, group_columns: Sequence[str] = ()) -> 
             ]
         )
 
-    count_columns = ["Attempts", "Approved", "Declined", "Hard declines", "Soft declines"]
+    count_columns = ["Checkout sessions", "Approved", "Declined", "Hard declines", "Soft declines"]
     summary[count_columns] = summary[count_columns].astype(int)
-    summary["Eligible attempts"] = summary["Attempts"] - summary["Hard declines"]
-    summary["Approval ratio (with hard)"] = summary["Approved"].div(summary["Attempts"])
+    summary["Eligible checkout sessions"] = summary["Checkout sessions"] - summary["Hard declines"]
+    summary["Approval ratio (with hard)"] = summary["Approved"].div(summary["Checkout sessions"])
     summary["Approval ratio (without hard)"] = summary["Approved"].div(
-        summary["Eligible attempts"].where(summary["Eligible attempts"].gt(0))
+        summary["Eligible checkout sessions"].where(summary["Eligible checkout sessions"].gt(0))
     )
     return summary
 
@@ -463,18 +535,18 @@ def _add_top_decline_reason(
 def performance_by_psp(data: pd.DataFrame) -> pd.DataFrame:
     summary = summarize_metrics(data, ["psp_name"])
     summary = _add_top_decline_reason(summary, data, ["psp_name"])
-    return summary.sort_values(["Approval ratio (with hard)", "Attempts", "psp_name"], ascending=[False, False, True])
+    return summary.sort_values(["Approval ratio (with hard)", "Checkout sessions", "psp_name"], ascending=[False, False, True])
 
 
 def performance_by_mid(data: pd.DataFrame) -> pd.DataFrame:
     summary = summarize_metrics(data, ["mid_alias"])
     summary = _add_top_decline_reason(summary, data, ["mid_alias"])
-    return summary.sort_values(["Approval ratio (with hard)", "Attempts", "mid_alias"], ascending=[False, False, True])
+    return summary.sort_values(["Approval ratio (with hard)", "Checkout sessions", "mid_alias"], ascending=[False, False, True])
 
 
 def performance_by_country(
     data: pd.DataFrame,
-    minimum_psp_attempts: int,
+    minimum_psp_sessions: int,
     ranking_column: str,
 ) -> pd.DataFrame:
     """Show country-level ratios and the best/worst qualified PSP in each country."""
@@ -485,26 +557,28 @@ def performance_by_country(
         return country
 
     psp_country = summarize_metrics(data, ["country_label", "psp_name"])
-    eligible = psp_country.loc[psp_country["Attempts"].ge(max(int(minimum_psp_attempts), 1))].copy()
+    eligible = psp_country.loc[
+        psp_country["Checkout sessions"].ge(max(int(minimum_psp_sessions), 1))
+    ].copy()
     if eligible.empty:
         country["PSPs compared"] = 0
         country["Best PSP"] = "No PSP met the minimum"
         country["Best PSP rate"] = float("nan")
         country["Worst PSP"] = "No PSP met the minimum"
         country["Worst PSP rate"] = float("nan")
-        return country.sort_values(["Attempts", "country_label"], ascending=[False, True])
+        return country.sort_values(["Checkout sessions", "country_label"], ascending=[False, True])
 
     rank_value = eligible[ranking_column].fillna(-1.0)
     eligible = eligible.assign(_rank_value=rank_value)
     psp_counts = eligible.groupby("country_label", observed=True).size().rename("PSPs compared").reset_index()
     best = (
-        eligible.sort_values(["country_label", "_rank_value", "Attempts", "psp_name"], ascending=[True, False, False, True])
+        eligible.sort_values(["country_label", "_rank_value", "Checkout sessions", "psp_name"], ascending=[True, False, False, True])
         .drop_duplicates("country_label", keep="first")
         [["country_label", "psp_name", ranking_column]]
         .rename(columns={"psp_name": "Best PSP", ranking_column: "Best PSP rate"})
     )
     worst = (
-        eligible.sort_values(["country_label", "_rank_value", "Attempts", "psp_name"], ascending=[True, True, False, True])
+        eligible.sort_values(["country_label", "_rank_value", "Checkout sessions", "psp_name"], ascending=[True, True, False, True])
         .drop_duplicates("country_label", keep="first")
         [["country_label", "psp_name", ranking_column]]
         .rename(columns={"psp_name": "Worst PSP", ranking_column: "Worst PSP rate"})
@@ -516,7 +590,7 @@ def performance_by_country(
     result.loc[one_psp, "Worst PSP rate"] = float("nan")
     result["Best PSP"] = result["Best PSP"].fillna("No PSP met the minimum")
     result["Worst PSP"] = result["Worst PSP"].fillna("No PSP met the minimum")
-    return result.sort_values(["Attempts", "country_label"], ascending=[False, True])
+    return result.sort_values(["Checkout sessions", "country_label"], ascending=[False, True])
 
 
 def daily_performance(data: pd.DataFrame) -> pd.DataFrame:
