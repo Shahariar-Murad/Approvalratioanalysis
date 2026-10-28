@@ -1,0 +1,4 @@
+decline_code,reason_contains,classification,note
+59,,Hard,Suspected fraud
+51,,Soft,Insufficient funds
+05,do not honor,Soft,Issuer decline policy
